@@ -4,7 +4,7 @@ name: Go
 
 on:
   push:
-    branches: [ master ]
+    branches: [ build ]
   pull_request:
     branches: [ master ]
 
