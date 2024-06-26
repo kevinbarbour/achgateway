@@ -49,8 +49,8 @@ teardown:
 	-docker-compose rm -sfv
 
 docker: update
-	docker build --pull --build-arg VERSION=${VERSION} -t moov/achgateway:${VERSION} -f Dockerfile .
-	docker tag moov/achgateway:${VERSION} moov/achgateway:latest
+	docker build --pull --build-arg VERSION=${VERSION} -t kevinbarbour/achgateway:${VERSION} -f Dockerfile .
+	docker tag kevinbarbour/achgateway:${VERSION} kevinbarbour/achgateway:latest
 
 docker-push:
 	docker push kevinbarbour/achgateway:${VERSION}
@@ -58,11 +58,11 @@ docker-push:
 
 .PHONY: dev-docker
 dev-docker: update
-	docker build --pull --build-arg VERSION=${DEV_VERSION} -t moov/achgateway:${DEV_VERSION} -f Dockerfile .
+	docker build --pull --build-arg VERSION=${DEV_VERSION} -t kevinbarbour/achgateway:${DEV_VERSION} -f Dockerfile .
 
 .PHONY: dev-push
 dev-push:
-	docker push moov/achgateway:${DEV_VERSION}
+	docker push kevinbarbour/achgateway:${DEV_VERSION}
 
 # Extra utilities not needed for building
 
@@ -70,7 +70,7 @@ run: update build
 	./bin/achgateway
 
 docker-run:
-	docker run -v ${PWD}/data:/data -v ${PWD}/configs:/configs --env APP_CONFIG="/configs/config.yml" -it --rm moov-io/achgateway:${VERSION}
+	docker run -v ${PWD}/data:/data -v ${PWD}/configs:/configs --env APP_CONFIG="/configs/config.yml" -it --rm kevinbarbour/achgateway:${VERSION}
 
 test: update
 	go test -cover github.com/moov-io/achgateway/...
