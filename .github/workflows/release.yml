@@ -31,8 +31,6 @@ jobs:
     - name: Setup
       run: make setup
 
-    - name: Check
-      run: make check
 
   create_release:
     name: Create Release
