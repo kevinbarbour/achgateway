@@ -53,8 +53,8 @@ docker: update
 	docker tag moov/achgateway:${VERSION} moov/achgateway:latest
 
 docker-push:
-	docker push moov/achgateway:${VERSION}
-	docker push moov/achgateway:latest
+	docker push kevinbarbour/achgateway:${VERSION}
+	docker push kevinbarbour/achgateway:latest
 
 .PHONY: dev-docker
 dev-docker: update
