@@ -111,6 +111,7 @@ func NewEnvironment(env *Environment) (*Environment, error) {
 
 	// db setup
 	if env.DB == nil && env.Config.Database.MySQL != nil {
+		env.Logger.Info().Log("connecting to mysql database")
 		db, close, err := initializeDatabase(env.Logger, env.Config.Database)
 		if err != nil {
 			close()
@@ -125,6 +126,10 @@ func NewEnvironment(env *Environment) (*Environment, error) {
 			cancelFunc()
 			close()
 		}
+	}
+
+	if env.Config.Database.Spanner == nil {
+		env.Logger.Info().Log("spanner database is not configured")
 	}
 
 	// spanner setup
@@ -184,6 +189,10 @@ func NewEnvironment(env *Environment) (*Environment, error) {
 
 	var fileRepository files.Repository
 	var shardRepository shards.Repository
+
+	if env.DB == nil && env.SpannerClient == nil {
+		env.Logger.Error().Log("no database or spanner client available")
+	}
 
 	if env.DB != nil {
 		fileRepository = files.NewRepository(env.DB)
