@@ -41,6 +41,8 @@ import (
 
 	"github.com/Shopify/sarama"
 	"gocloud.dev/pubsub"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // FileReceiver accepts an ACH file from a number of pubsub Subscriptions and
@@ -464,6 +466,7 @@ func (fr *FileReceiver) processACHFile(ctx context.Context, file incoming.ACHFil
 	})
 
 	// We only want to handle files once, so become the winner by saving the record.
+	// However, files may already be persisted via HTTP API for synchronous processing.
 	hostname, _ := os.Hostname()
 	err = fr.fileRepository.Record(ctx, files.AcceptedFile{
 		FileID:     file.FileID,
@@ -472,8 +475,13 @@ func (fr *FileReceiver) processACHFile(ctx context.Context, file incoming.ACHFil
 		AcceptedAt: time.Now().In(time.UTC),
 	})
 	if err != nil {
-		logger.Warn().LogErrorf("not handling received ACH file: %v", err)
-		return nil
+		// Check if this is a duplicate key error (file already exists)
+		if isDuplicateKeyError(err) {
+			logger.Info().Log("file already persisted, continuing with processing")
+		} else {
+			logger.Warn().LogErrorf("not handling received ACH file: %v", err)
+			return nil
+		}
 	}
 	logger.Log("begin handling of received ACH file")
 
@@ -523,4 +531,28 @@ func (fr *FileReceiver) cancelACHFile(ctx context.Context, cancel *models.Cancel
 
 	logger.Log("finished cancel of file")
 	return nil
+}
+
+// isDuplicateKeyError checks if the error is a duplicate key/primary key violation
+// for both MySQL and Spanner databases
+func isDuplicateKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+	
+	// MySQL duplicate entry errors
+	if strings.Contains(errStr, "Duplicate entry") || strings.Contains(errStr, "Error 1062") {
+		return true
+	}
+	
+	// Spanner already exists errors
+	if st, ok := status.FromError(err); ok {
+		if st.Code() == codes.AlreadyExists {
+			return true
+		}
+	}
+	
+	return false
 }

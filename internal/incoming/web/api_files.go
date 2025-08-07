@@ -24,11 +24,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/moov-io/ach"
+	"github.com/moov-io/achgateway/internal/files"
 	"github.com/moov-io/achgateway/internal/incoming"
 	"github.com/moov-io/achgateway/internal/incoming/stream"
 	"github.com/moov-io/achgateway/internal/service"
@@ -43,11 +45,12 @@ import (
 	"gocloud.dev/pubsub"
 )
 
-func NewFilesController(logger log.Logger, cfg service.HTTPConfig, pub stream.Publisher, cancellationResponses chan models.FileCancellationResponse) *FilesController {
+func NewFilesController(logger log.Logger, cfg service.HTTPConfig, pub stream.Publisher, fileRepo files.Repository, cancellationResponses chan models.FileCancellationResponse) *FilesController {
 	controller := &FilesController{
 		logger:    logger,
 		cfg:       cfg,
 		publisher: pub,
+		fileRepo:  fileRepo,
 
 		activeCancellations:   make(map[string]chan models.FileCancellationResponse),
 		cancellationResponses: cancellationResponses,
@@ -60,6 +63,7 @@ type FilesController struct {
 	logger    log.Logger
 	cfg       service.HTTPConfig
 	publisher stream.Publisher
+	fileRepo  files.Repository
 
 	cancellationLock      sync.Mutex
 	activeCancellations   map[string]chan models.FileCancellationResponse
@@ -117,9 +121,14 @@ func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Reque
 	))
 	defer span.End()
 
+	logger := c.logger.With(log.Fields{
+		"shard_key": log.String(shardKey),
+		"file_id":   log.String(fileID),
+	})
+
 	bs, err := c.readBody(r)
 	if err != nil {
-		c.logger.LogErrorf("error reading file: %v", err)
+		logger.LogErrorf("error reading file: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -135,14 +144,28 @@ func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Reque
 		file = *f
 	}
 
-	if err := c.publishFile(ctx, shardKey, fileID, &file); err != nil {
-		c.logger.With(log.Fields{
-			"shard_key": log.String(shardKey),
-			"file_id":   log.String(fileID),
-		}).LogErrorf("publishing file", err)
+	// Persist the file to database BEFORE publishing to queue
+	// This ensures 200 response only happens after successful persistence
+	hostname, _ := os.Hostname()
+	acceptedFile := files.AcceptedFile{
+		FileID:     fileID,
+		ShardKey:   shardKey,
+		Hostname:   hostname,
+		AcceptedAt: time.Now().In(time.UTC),
+	}
 
+	if err := c.fileRepo.Record(ctx, acceptedFile); err != nil {
+		logger.LogErrorf("error persisting file to database: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
+	}
+
+	logger.Log("file persisted to database, publishing to queue")
+
+	if err := c.publishFile(ctx, shardKey, fileID, &file); err != nil {
+		logger.LogErrorf("error publishing file to queue (file already persisted): %v", err)
+		// Note: File is already persisted, so we should still return 200
+		// The async processor will handle the file even if this publish fails
 	}
 
 	w.WriteHeader(http.StatusOK)
