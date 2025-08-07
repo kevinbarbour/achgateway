@@ -154,13 +154,46 @@ func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Reque
 		AcceptedAt: time.Now().In(time.UTC),
 	}
 
-	if err := c.fileRepo.Record(ctx, acceptedFile); err != nil {
-		logger.LogErrorf("error persisting file to database: %v", err)
+	// Add timeout for database operations to prevent hanging HTTP requests
+	timeout := c.cfg.DatabaseTimeout
+	if timeout == 0 {
+		timeout = 30 * time.Second // Default timeout
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	start := time.Now()
+	if err := c.fileRepo.Record(dbCtx, acceptedFile); err != nil {
+		duration := time.Since(start)
+		logger.With(log.Fields{
+			"duration_ms": log.Float64(float64(duration.Nanoseconds()) / 1e6),
+			"operation":   log.String("database_record"),
+		}).LogErrorf("error persisting file to database: %v", err)
+		
+		// Add telemetry attributes for failed database operation
+		span.SetAttributes(
+			attribute.Float64("achgateway.database.duration_ms", float64(duration.Nanoseconds())/1e6),
+			attribute.String("achgateway.database.operation", "record_file"),
+			attribute.Bool("achgateway.database.success", false),
+			attribute.String("achgateway.database.error", err.Error()),
+		)
+		
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	
+	duration := time.Since(start)
+	logger.With(log.Fields{
+		"duration_ms": log.Float64(float64(duration.Nanoseconds()) / 1e6),
+		"operation":   log.String("database_record"),
+	}).Log("file persisted to database successfully, publishing to queue")
 
-	logger.Log("file persisted to database, publishing to queue")
+	// Add telemetry attributes for database operation monitoring
+	span.SetAttributes(
+		attribute.Float64("achgateway.database.duration_ms", float64(duration.Nanoseconds())/1e6),
+		attribute.String("achgateway.database.operation", "record_file"),
+		attribute.Bool("achgateway.database.success", true),
+	)
 
 	if err := c.publishFile(ctx, shardKey, fileID, &file); err != nil {
 		logger.LogErrorf("error publishing file to queue (file already persisted): %v", err)

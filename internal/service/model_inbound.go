@@ -53,6 +53,10 @@ type HTTPConfig struct {
 
 	Transform    *models.TransformConfig
 	MaxBodyBytes int64
+	
+	// DatabaseTimeout specifies the maximum time to wait for database operations
+	// during HTTP request processing. Defaults to 30 seconds if not set.
+	DatabaseTimeout time.Duration
 }
 
 type InMemory struct {
