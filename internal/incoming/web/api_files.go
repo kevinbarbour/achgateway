@@ -45,6 +45,28 @@ import (
 	"gocloud.dev/pubsub"
 )
 
+const (
+	// Default timeout for database operations in HTTP handlers
+	defaultDatabaseTimeout = 30 * time.Second
+	
+	// Maximum retry attempts for transient database failures
+	maxRetryAttempts = 2
+	
+	// Maximum backoff time for retry attempts
+	maxBackoffTime = 2 * time.Second
+)
+
+// NewFilesController creates a new HTTP file submission controller with synchronous database persistence.
+// 
+// This controller ensures that HTTP 200 responses are only returned after successful database persistence,
+// addressing the issue where async persistence failures would result in silent data loss.
+//
+// Parameters:
+//   - logger: Logger for structured logging and monitoring
+//   - cfg: HTTP configuration including database timeout settings
+//   - pub: Publisher for asynchronous downstream processing
+//   - fileRepo: Repository for synchronous file persistence
+//   - cancellationResponses: Channel for file cancellation coordination
 func NewFilesController(logger log.Logger, cfg service.HTTPConfig, pub stream.Publisher, fileRepo files.Repository, cancellationResponses chan models.FileCancellationResponse) *FilesController {
 	controller := &FilesController{
 		logger:    logger,
@@ -107,6 +129,21 @@ func (c *FilesController) AppendRoutes(router *mux.Router) *mux.Router {
 	return router
 }
 
+// CreateFileHandler handles HTTP file submission with guaranteed persistence.
+//
+// This handler implements a synchronous persistence model where the HTTP 200 response
+// is only returned after successful database persistence. This ensures clients can
+// rely on a 200 response as confirmation that their file has been durably stored.
+//
+// The flow is:
+// 1. Parse and validate the ACH file
+// 2. Persist file metadata to database (with timeout and retry logic)
+// 3. Publish to queue for downstream processing (failure doesn't affect response)
+// 4. Return HTTP 200 only after successful persistence
+//
+// Error handling:
+//   - HTTP 400: Invalid file format or missing parameters
+//   - HTTP 500: Database persistence failure (includes timeout and retry exhaustion)
 func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	shardKey, fileID := vars["shardKey"], vars["fileID"]
@@ -157,13 +194,13 @@ func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Reque
 	// Add timeout for database operations to prevent hanging HTTP requests
 	timeout := c.cfg.DatabaseTimeout
 	if timeout == 0 {
-		timeout = 30 * time.Second // Default timeout
+		timeout = defaultDatabaseTimeout
 	}
 	dbCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	start := time.Now()
-	if err := c.recordFileWithRetry(dbCtx, acceptedFile, 2); err != nil {
+	if err := c.recordFileWithRetry(dbCtx, acceptedFile, maxRetryAttempts); err != nil {
 		duration := time.Since(start)
 		errorClass := classifyDatabaseError(err)
 		
@@ -171,7 +208,7 @@ func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Reque
 			"duration_ms":  log.Float64(float64(duration.Nanoseconds()) / 1e6),
 			"operation":    log.String("database_record"),
 			"error_class":  log.String(errorClass),
-			"retry_count":  log.Int(2),
+			"retry_count":  log.Int(maxRetryAttempts),
 		}).LogErrorf("error persisting file to database after retries: %v", err)
 		
 		// Add telemetry attributes for failed database operation
@@ -181,7 +218,7 @@ func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Reque
 			attribute.Bool("achgateway.database.success", false),
 			attribute.String("achgateway.database.error", err.Error()),
 			attribute.String("achgateway.database.error_class", errorClass),
-			attribute.Int("achgateway.database.retry_count", 2),
+			attribute.Int("achgateway.database.retry_count", maxRetryAttempts),
 		)
 		
 		w.WriteHeader(http.StatusInternalServerError)
@@ -312,8 +349,8 @@ func (c *FilesController) recordFileWithRetry(ctx context.Context, acceptedFile 
 		if attempt > 0 {
 			// Exponential backoff with jitter
 			backoff := time.Duration(attempt*attempt) * 100 * time.Millisecond
-			if backoff > 2*time.Second {
-				backoff = 2 * time.Second
+			if backoff > maxBackoffTime {
+				backoff = maxBackoffTime
 			}
 			
 			select {
