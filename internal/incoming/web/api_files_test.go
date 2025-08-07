@@ -21,11 +21,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,7 +48,7 @@ func TestCreateFileHandler(t *testing.T) {
 
 	cancellationResponses := make(chan models.FileCancellationResponse)
 	fileRepo := files.NewMockRepository()
-	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, fileRepo, cancellationResponses)
+	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, cancellationResponses, fileRepo)
 	r := mux.NewRouter()
 	controller.AppendRoutes(r)
 
@@ -79,7 +82,7 @@ func TestCreateFileHandlerErr(t *testing.T) {
 
 	cancellationResponses := make(chan models.FileCancellationResponse)
 	fileRepo := files.NewMockRepository()
-	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, fileRepo, cancellationResponses)
+	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, cancellationResponses, fileRepo)
 	r := mux.NewRouter()
 	controller.AppendRoutes(r)
 
@@ -97,7 +100,7 @@ func TestCancelFileHandler(t *testing.T) {
 
 	cancellationResponses := make(chan models.FileCancellationResponse)
 	fileRepo := files.NewMockRepository()
-	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, fileRepo, cancellationResponses)
+	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, cancellationResponses, fileRepo)
 	r := mux.NewRouter()
 	controller.AppendRoutes(r)
 
@@ -134,4 +137,168 @@ func TestCancelFileHandler(t *testing.T) {
 	require.Equal(t, "f2.ach", response.FileID)
 	require.Equal(t, "s2", response.ShardKey)
 	require.True(t, response.Successful)
+}
+
+func TestCreateFileHandler_DatabasePersistenceFailure(t *testing.T) {
+	topic, _ := streamtest.InmemStream(t)
+
+	cancellationResponses := make(chan models.FileCancellationResponse)
+	fileRepo := files.NewMockRepository().(*files.MockRepository)
+	
+	// Simulate database persistence failure
+	fileRepo.SetError(errors.New("spanner: code = \"DeadlineExceeded\", desc = \"context deadline exceeded\""))
+	
+	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, cancellationResponses, fileRepo)
+	r := mux.NewRouter()
+	controller.AppendRoutes(r)
+
+	// Send a valid file over HTTP
+	bs, _ := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "ppd-valid.json"))
+	req := httptest.NewRequest("POST", "/shards/s1/files/f1", bytes.NewReader(bs))
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Should return 500 when database persistence fails
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestCreateFileHandler_ConcurrentSameFileID(t *testing.T) {
+	topic, sub := streamtest.InmemStream(t)
+
+	cancellationResponses := make(chan models.FileCancellationResponse)
+	fileRepo := files.NewMockRepository()
+	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, cancellationResponses, fileRepo)
+	r := mux.NewRouter()
+	controller.AppendRoutes(r)
+
+	// Load test file
+	bs, _ := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "ppd-valid.json"))
+
+	// Submit the same file ID concurrently
+	var wg sync.WaitGroup
+	const numGoroutines = 5
+	results := make([]int, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			
+			req := httptest.NewRequest("POST", "/shards/s1/files/concurrent-test", bytes.NewReader(bs))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			
+			results[index] = w.Code
+		}(i)
+	}
+
+	wg.Wait()
+
+	// All requests should succeed (200) since our implementation handles duplicates gracefully
+	successCount := 0
+	for _, code := range results {
+		require.True(t, code == http.StatusOK, fmt.Sprintf("Expected 200, got %d", code))
+		if code == http.StatusOK {
+			successCount++
+		}
+	}
+	require.Equal(t, numGoroutines, successCount)
+
+	// Verify we received messages (could be multiple due to concurrent processing)
+	for i := 0; i < numGoroutines; i++ {
+		msg, err := sub.Receive(context.Background())
+		require.NoError(t, err)
+		
+		var file incoming.ACHFile
+		require.NoError(t, models.ReadEvent(msg.Body, &file))
+		require.Equal(t, "concurrent-test", file.FileID)
+	}
+}
+
+func TestCreateFileHandler_SpannerTimeoutError(t *testing.T) {
+	topic, _ := streamtest.InmemStream(t)
+
+	cancellationResponses := make(chan models.FileCancellationResponse)
+	fileRepo := files.NewMockRepository().(*files.MockRepository)
+	
+	// Simulate specific Spanner timeout error
+	fileRepo.SetError(errors.New("spanner: code = \"DeadlineExceeded\", desc = \"context deadline exceeded, transaction outcome unknown\""))
+	
+	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, cancellationResponses, fileRepo)
+	r := mux.NewRouter()
+	controller.AppendRoutes(r)
+
+	// Send a valid file over HTTP
+	bs, _ := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "ppd-valid.json"))
+	req := httptest.NewRequest("POST", "/shards/s1/files/timeout-test", bytes.NewReader(bs))
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Should return 500 for database timeout errors
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestCreateFileHandler_DatabaseRecovery(t *testing.T) {
+	topic, sub := streamtest.InmemStream(t)
+
+	cancellationResponses := make(chan models.FileCancellationResponse)
+	fileRepo := files.NewMockRepository().(*files.MockRepository)
+	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, cancellationResponses, fileRepo)
+	r := mux.NewRouter()
+	controller.AppendRoutes(r)
+
+	// Load test file
+	bs, _ := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "ppd-valid.json"))
+
+	// First request fails due to database error
+	fileRepo.SetError(errors.New("database connection failed"))
+	
+	req1 := httptest.NewRequest("POST", "/shards/s1/files/recovery-test-1", bytes.NewReader(bs))
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, req1)
+	require.Equal(t, http.StatusInternalServerError, w1.Code)
+
+	// Second request succeeds after database recovery
+	fileRepo.SetError(nil)
+	
+	req2 := httptest.NewRequest("POST", "/shards/s1/files/recovery-test-2", bytes.NewReader(bs))
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	require.Equal(t, http.StatusOK, w2.Code)
+
+	// Verify successful message was published
+	msg, err := sub.Receive(context.Background())
+	require.NoError(t, err)
+	
+	var file incoming.ACHFile
+	require.NoError(t, models.ReadEvent(msg.Body, &file))
+	require.Equal(t, "recovery-test-2", file.FileID)
+}
+
+func TestCreateFileHandler_PublishingFailureAfterPersistence(t *testing.T) {
+	// This test verifies that publishing failures don't affect HTTP response
+	// when the file has already been successfully persisted
+	topic, _ := streamtest.InmemStream(t)
+	
+	// Close the topic to simulate publishing failure
+	topic.Shutdown(context.Background())
+
+	cancellationResponses := make(chan models.FileCancellationResponse)
+	fileRepo := files.NewMockRepository() // No errors set - persistence succeeds
+	controller := NewFilesController(log.NewTestLogger(), service.HTTPConfig{}, topic, cancellationResponses, fileRepo)
+	r := mux.NewRouter()
+	controller.AppendRoutes(r)
+
+	// Send a valid file over HTTP
+	bs, _ := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "ppd-valid.json"))
+	req := httptest.NewRequest("POST", "/shards/s1/files/publish-fail-test", bytes.NewReader(bs))
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Should still return 200 because file was successfully persisted
+	// even though publishing failed
+	require.Equal(t, http.StatusOK, w.Code)
 }
