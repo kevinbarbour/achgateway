@@ -163,12 +163,16 @@ func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Reque
 	defer cancel()
 
 	start := time.Now()
-	if err := c.fileRepo.Record(dbCtx, acceptedFile); err != nil {
+	if err := c.recordFileWithRetry(dbCtx, acceptedFile, 2); err != nil {
 		duration := time.Since(start)
+		errorClass := classifyDatabaseError(err)
+		
 		logger.With(log.Fields{
-			"duration_ms": log.Float64(float64(duration.Nanoseconds()) / 1e6),
-			"operation":   log.String("database_record"),
-		}).LogErrorf("error persisting file to database: %v", err)
+			"duration_ms":  log.Float64(float64(duration.Nanoseconds()) / 1e6),
+			"operation":    log.String("database_record"),
+			"error_class":  log.String(errorClass),
+			"retry_count":  log.Int(2),
+		}).LogErrorf("error persisting file to database after retries: %v", err)
 		
 		// Add telemetry attributes for failed database operation
 		span.SetAttributes(
@@ -176,6 +180,8 @@ func (c *FilesController) CreateFileHandler(w http.ResponseWriter, r *http.Reque
 			attribute.String("achgateway.database.operation", "record_file"),
 			attribute.Bool("achgateway.database.success", false),
 			attribute.String("achgateway.database.error", err.Error()),
+			attribute.String("achgateway.database.error_class", errorClass),
+			attribute.Int("achgateway.database.retry_count", 2),
 		)
 		
 		w.WriteHeader(http.StatusInternalServerError)
@@ -239,6 +245,109 @@ func (c *FilesController) publishFile(ctx context.Context, shardKey, fileID stri
 		Body:     bs,
 		Metadata: meta,
 	})
+}
+
+// isTransientError determines if an error is likely transient and worth retrying
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	errStr := err.Error()
+	// Check for common transient error patterns
+	return strings.Contains(errStr, "context deadline exceeded") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "temporary failure") ||
+		strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "UNAVAILABLE") ||
+		strings.Contains(errStr, "DeadlineExceeded")
+}
+
+// isDuplicateKeyError determines if an error indicates a duplicate key constraint violation
+func isDuplicateKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	errStr := err.Error()
+	// Check for duplicate key error patterns in different databases
+	return strings.Contains(errStr, "duplicate key") ||
+		strings.Contains(errStr, "UNIQUE constraint") ||
+		strings.Contains(errStr, "AlreadyExists") ||
+		strings.Contains(errStr, "Entry already exists")
+}
+
+// classifyDatabaseError categorizes database errors for better handling and monitoring
+func classifyDatabaseError(err error) string {
+	if err == nil {
+		return "none"
+	}
+	
+	if isDuplicateKeyError(err) {
+		return "duplicate_key"
+	}
+	
+	if isTransientError(err) {
+		return "transient"
+	}
+	
+	errStr := err.Error()
+	if strings.Contains(errStr, "permission") || strings.Contains(errStr, "authentication") {
+		return "permission"
+	}
+	
+	if strings.Contains(errStr, "not found") || strings.Contains(errStr, "NotFound") {
+		return "not_found"
+	}
+	
+	return "permanent"
+}
+
+// recordFileWithRetry attempts to record a file with retry logic for transient failures
+func (c *FilesController) recordFileWithRetry(ctx context.Context, acceptedFile files.AcceptedFile, maxRetries int) error {
+	var lastErr error
+	
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff with jitter
+			backoff := time.Duration(attempt*attempt) * 100 * time.Millisecond
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+			
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		
+		err := c.fileRepo.Record(ctx, acceptedFile)
+		if err == nil {
+			return nil // Success
+		}
+		
+		lastErr = err
+		errorClass := classifyDatabaseError(err)
+		
+		// Don't retry duplicate key errors - they indicate the file is already processed
+		if errorClass == "duplicate_key" {
+			return nil // Treat duplicate as success since file is already recorded
+		}
+		
+		// Don't retry permanent errors
+		if errorClass == "permanent" || errorClass == "permission" {
+			break
+		}
+		
+		// Only retry transient errors
+		if errorClass != "transient" {
+			break
+		}
+	}
+	
+	return lastErr
 }
 
 func (c *FilesController) CancelFileHandler(w http.ResponseWriter, r *http.Request) {
